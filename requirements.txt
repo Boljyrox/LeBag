@@ -1,0 +1,8 @@
+flask
+flask-cors
+requests
+opencv-python
+numpy
+pyzbar
+ultralytics==8.1.29
+lapx>=0.5.2
