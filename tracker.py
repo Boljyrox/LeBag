@@ -7,66 +7,22 @@ import json
 import os
 import fcntl
 
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
 from ultralytics import YOLO
+
+# --------------------------
+# Configuration
+# --------------------------
+SERVER_API_URL = "http://localhost:5001"
+ANDROID_STREAM_URL = "http://192.168.88.7:8080/video"
 
 # --------------------------
 # State Management
 # --------------------------
-id_to_label = {}
-id_to_match_info = {}
-id_to_db_key = {}
-
-known_bag_gallery = {} # db_key -> np.array mapping
-db_key_to_label = {}   # db_key -> owner string mapping
-
-DB_FILE = "bag_database.json"
-
-def load_database_safe():
-    if not os.path.exists(DB_FILE):
-        return {}
-    try:
-        with open(DB_FILE, 'r') as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            db = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
-        return db
-    except Exception as e:
-        print(f"⚠️ Error loading database: {e}")
-        return {}
-
-def update_database_safe(new_data_dict):
-    try:
-        with open(DB_FILE, 'a+') as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            try:
-                content = f.read()
-                db = json.loads(content) if content else {}
-            except json.JSONDecodeError:
-                db = {}
-            
-            for k, v in new_data_dict.items():
-                if k not in db:
-                    db[k] = v
-                else:
-                    db[k].update(v)
-                    
-            f.seek(0)
-            f.truncate()
-            json.dump(db, f, indent=4)
-            fcntl.flock(f, fcntl.LOCK_UN)
-    except Exception as e:
-        print(f"⚠️ Error updating database: {e}")
-
-def sync_gallery():
-    db = load_database_safe()
-    for db_key, info in db.items():
-        if "embedding" in info:
-            known_bag_gallery[db_key] = np.array(info["embedding"], dtype=np.float32)
-            db_key_to_label[db_key] = info.get("owner", "Unknown")
+active_assignments = {} # track_id -> passenger_name
+id_zones = {} # track_id -> "A" or "B"
+unassigned_ids = set() # IDs currently waiting for a name
+last_seen_frames = {} # track_id -> frame_count for cleanup
+last_known_positions = {} # track_id -> (x1, y1, x2, y2)
 
 # --------------------------
 # Background Video Streamer
@@ -75,7 +31,10 @@ class VideoStream:
     def __init__(self, src):
         self.stream = cv2.VideoCapture(src)
         if not self.stream.isOpened():
-            print(f"Warning: Could not open video source {src}")
+            print(f"⚠️ Could not open stream {src}. Please double check the IP address. Falling back to default camera (0).")
+            self.stream = cv2.VideoCapture(0)
+            if not self.stream.isOpened():
+                print("Error: Could not open any video source.")
         self.grabbed, self.frame = self.stream.read()
         self.stopped = False
         self.lock = threading.Lock()
@@ -102,62 +61,34 @@ class VideoStream:
         self.stopped = True
         self.stream.release()
 
-# --------------------------
-# Re-Identification Extractor
-# --------------------------
-class ReIDExtractor:
-    def __init__(self):
-        import ssl
-        try:
-            _create_unverified_https_context = ssl._create_unverified_context
-        except AttributeError:
-            pass
-        else:
-            ssl._create_default_https_context = _create_unverified_https_context
+def pop_name_from_queue():
+    """Tries to pop a single passenger name from the server queue."""
+    try:
+        response = requests.get(f"{SERVER_API_URL}/api/pop_pending", timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("name") # Will be None if queue is empty
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Warning: Could not reach server to pop queue ({e})")
+    return None
 
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-            
-        print(f"Loading MobileNetV2 Re-ID Model on {self.device}...")
-        weights = models.MobileNet_V2_Weights.IMAGENET1K_V1
-        base_model = models.mobilenet_v2(weights=weights)
-        self.extractor = base_model.features
-        self.extractor.add_module('pooling', nn.AdaptiveAvgPool2d((1, 1)))
-        self.extractor.add_module('flatten', nn.Flatten())
-        
-        self.extractor.to(self.device).eval()
-        
-        self.transforms = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+def trigger_zone_transition(name, zone):
+    """Notifies backend that a bag moved to a new zone."""
+    try:
+        url = f"{SERVER_API_URL}/api/luggage_zone" # Assuming this endpoint exists or will exist
+        print(f"📡 [Event] {name} entered Zone {zone}")
+    except Exception as e:
+        pass
 
-    def get_embedding(self, frame, box):
-        x1, y1, x2, y2 = map(int, box)
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
-            return None
-            
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        tensor = self.transforms(crop_rgb).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            feat = self.extractor(tensor).cpu().numpy().flatten()
-            
-        norm = np.linalg.norm(feat)
-        if norm > 0:
-            return feat / norm
-        return feat
+def trigger_bag_collected(name):
+    """Notifies backend that a bag has been removed/collected."""
+    try:
+        url = f"{SERVER_API_URL}/api/luggage_collected" # Assuming this endpoint exists or will exist
+        print(f"✅ [Event] {name}'s Bag was Collected! Notify Passenger.")
+    except Exception as e:
+        pass
+
+
 
 def send_to_backend(track_id, label):
     url = "http://localhost:5000/api/luggage"
@@ -168,27 +99,24 @@ def send_to_backend(track_id, label):
         print(f"Error sending data to backend: {e}")
 
 def main():
-    stream_url = "tcp://192.168.2.2:5000"
-    print(f"Connecting to Pi stream at {stream_url}...")
+    print(f"Connecting to Android Phone stream at {ANDROID_STREAM_URL}...")
     
-    vs = VideoStream(stream_url).start()
+    vs = VideoStream(ANDROID_STREAM_URL).start()
     time.sleep(2.0)
     
-    print("Loading YOLOv8-nano model...")
+    import torch
+    
+    print("Loading YOLOv8-nano pretrained model...")
     _original_load = torch.load
     def _patched_load(*args, **kwargs):
         kwargs['weights_only'] = False
         return _original_load(*args, **kwargs)
     torch.load = _patched_load
     
-    model = YOLO("yolov8n.pt")
-    baggage_classes = [24, 26, 28]
-
-    reid_model = ReIDExtractor()
-
-    # Initial sync
-    sync_gallery()
-    print(f"Initially loaded {len(known_bag_gallery)} bags with RE-ID embeddings from database.")
+    model = YOLO("best.pt")
+    if torch.backends.mps.is_available():
+        model.to('mps')
+        print("Using MPS acceleration for tracking.")
 
     print("Starting tracking loop. Press 'q' to quit.")
     
@@ -199,95 +127,120 @@ def main():
         if not grabbed or frame is None:
             time.sleep(0.01)
             continue
-            
         frame_count += 1
-        
-        if frame_count % 30 == 0:
-            sync_gallery()
             
+        # Get Frame Width for Logical Zones
+        height, width = frame.shape[:2]
+        zone_divider = width // 2
+        
+        # Draw logical zone divider and collection line
+        annotated_frame = frame.copy()
+        cv2.line(annotated_frame, (zone_divider, 0), (zone_divider, height), (0, 0, 255), 2)
+        cv2.putText(annotated_frame, "ZONE A", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(annotated_frame, "ZONE B", (width - 150, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        collection_line_y = int(height * 0.95)
+        cv2.line(annotated_frame, (0, collection_line_y), (width, collection_line_y), (0, 255, 0), 2)
+        cv2.putText(annotated_frame, "COLLECTION ZONE", (50, collection_line_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         results = model.track(frame, 
-                              classes=baggage_classes, 
                               persist=True, 
+                              classes=[0], # Class 0 is custom 'Luggage' in best.pt
+                              conf=0.25,
                               tracker="bytetrack.yaml", 
                               verbose=False)
         
-        annotated_frame = frame.copy()
         
         if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu()
             track_ids = results[0].boxes.id.int().cpu().tolist()
             class_ids = results[0].boxes.cls.int().cpu().tolist()
+            confs = results[0].boxes.conf.cpu().tolist()
             
-            for box, track_id, cls_id in zip(boxes, track_ids, class_ids):
+            current_frame_ids = set(track_ids)
+            
+            for box, track_id, cls_id, conf in zip(boxes, track_ids, class_ids, confs):
+                # Update last seen and position
+                last_seen_frames[track_id] = frame_count
                 x1, y1, x2, y2 = map(int, box)
+                last_known_positions[track_id] = (x1, y1, x2, y2)
                 
-                if track_id not in id_to_label:
-                    feature = reid_model.get_embedding(frame, box)
-                    
-                    assigned_label = None
-                    assigned_db_key = None
-                    reid_match_pct = 0.0
-                    
-                    if feature is not None and len(known_bag_gallery) > 0:
-                        best_sim = -1.0
-                        best_db_key = None
-                        
-                        for gal_key, gal_feat in known_bag_gallery.items():
-                            sim = np.dot(feature, gal_feat)
-                            if sim > best_sim:
-                                best_sim = sim
-                                best_db_key = gal_key
-                                
-                        if best_sim >= 0.85:
-                            assigned_db_key = best_db_key
-                            assigned_label = db_key_to_label.get(best_db_key, "Unknown")
-                            reid_match_pct = best_sim * 100.0
-                            
-                    if assigned_label is not None:
-                        id_to_label[track_id] = assigned_label
-                        id_to_db_key[track_id] = assigned_db_key
-                        id_to_match_info[track_id] = f"{reid_match_pct:.1f}%"
-                        print(f"Re-Identified Track ID {track_id} as '{assigned_label}' | Match: {reid_match_pct:.1f}%")
+                center_x = (x1 + x2) // 2
+                
+                # Check Zone Status
+                current_zone = "A" if center_x <= zone_divider else "B"
+                if track_id not in id_zones:
+                     id_zones[track_id] = current_zone
+                elif id_zones[track_id] != current_zone:
+                     # Zone crossed!
+                     id_zones[track_id] = current_zone
+                     if track_id in active_assignments:
+                         trigger_zone_transition(active_assignments[track_id], current_zone)
+
+                # FIFO Assignment Logic
+                if track_id not in active_assignments and track_id not in unassigned_ids:
+                    # New bag appeared! Ask server for a name
+                    name = pop_name_from_queue()
+                    if name:
+                        active_assignments[track_id] = name
+                        print(f"🧳 Assigned Track ID {track_id} -> {name}")
                     else:
-                        label = f"Unregistered Bag"
-                        id_to_label[track_id] = label
-                        id_to_match_info[track_id] = "NEW"
-                        send_to_backend(track_id, label)
-                        
-                elif track_id in id_to_db_key and frame_count % 5 == 0:
-                    db_key = id_to_db_key[track_id]
-                    if db_key in known_bag_gallery:
-                        feature = reid_model.get_embedding(frame, box)
-                        if feature is not None:
-                            alpha = 0.95
-                            merged = alpha * known_bag_gallery[db_key] + (1 - alpha) * feature
-                            norm = np.linalg.norm(merged)
-                            if norm > 0:
-                                updated_feat = merged / norm
-                                known_bag_gallery[db_key] = updated_feat
-                                def bg_update(key, feat):
-                                    update_database_safe({key: {"embedding": feat.tolist()}})
-                                t = threading.Thread(target=bg_update, args=(db_key, updated_feat))
-                                t.daemon = True
-                                t.start()
-                
-                label_text = id_to_label.get(track_id, "Unknown")
-                match_info = id_to_match_info.get(track_id, "")
+                        unassigned_ids.add(track_id)
+                elif track_id in unassigned_ids:
+                     # Try to ping server again (maybe they just scanned it)
+                     if frame_count % 30 == 0:
+                         name = pop_name_from_queue()
+                         if name:
+                             unassigned_ids.remove(track_id)
+                             active_assignments[track_id] = name
+                             print(f"🧳 Assigned Track ID {track_id} -> {name} (delayed)")
+
+                label_text = active_assignments.get(track_id, "Unknown Owner")
                 cls_name = model.names[cls_id].capitalize()
                 
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 144, 30), 2)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 144, 30), 3)
                 
-                if match_info == "NEW" or match_info == "":
-                    display_text = f"ID:{track_id} | {label_text} ({cls_name})"
-                    color = (255, 144, 30) # Default Orange
+                if track_id in active_assignments:
+                    display_text = f"[{track_id}] {label_text}"
+                    color = (0, 255, 0) # Green for assigned
                 else:
-                    display_text = f"RE-ID: {label_text} | Match: {match_info} ({cls_name})"
-                    color = (0, 255, 0) # Green for Re-Identified objects
+                    display_text = f"[{track_id}] {cls_name} {conf:.2f}"
+                    color = (0, 0, 255) # Red for unassigned
                     
-                (text_w, text_h), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                (text_w, text_h), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
                 cv2.rectangle(annotated_frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
                 cv2.putText(annotated_frame, display_text, (x1, y1 - 5), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            
+            # Check for vanished bags to trigger collection
+            vanished_threshold_frames = 30 # E.g., not seen for 1 second at 30fps
+            for tid in list(active_assignments.keys()):
+                if tid not in current_frame_ids and (frame_count - last_seen_frames.get(tid, 0)) > vanished_threshold_frames:
+                    
+                    x1, y1, x2, y2 = last_known_positions.get(tid, (0, 0, 0, 0))
+                    
+                    # Edge Rejection Logic
+                    if y1 < 50 or x1 < 50 or x2 > width - 50:
+                        print(f"🧹 Cleaned up Track ID {tid} (Lost at Edge)")
+                    # Collection Trigger Logic
+                    elif y2 > collection_line_y:
+                        trigger_bag_collected(active_assignments[tid])
+                        print(f"✅ Bag Collected: Track ID {tid}")
+                    else:
+                        print(f"🧹 Cleaned up Track ID {tid} (Lost in mid-frame)")
+                        
+                    del active_assignments[tid]
+                    if tid in id_zones: del id_zones[tid]
+                    if tid in last_seen_frames: del last_seen_frames[tid]
+                    if tid in last_known_positions: del last_known_positions[tid]
+                    
+            for tid in list(unassigned_ids):
+                if tid not in current_frame_ids and (frame_count - last_seen_frames.get(tid, 0)) > vanished_threshold_frames:
+                    print(f"🧹 Cleaned up unassigned Track ID {tid}")
+                    unassigned_ids.remove(tid)
+                    if tid in id_zones: del id_zones[tid]
+                    if tid in last_seen_frames: del last_seen_frames[tid]
+                    if tid in last_known_positions: del last_known_positions[tid]
 
         cv2.imshow("Luggage Tracking", annotated_frame)
 
